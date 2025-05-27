@@ -1,15 +1,8 @@
-import { 
-    // Keypair,
-    Connection, 
+import {  
     PublicKey, 
-    // Transaction,
     TransactionInstruction,
     TransactionMessage,        
     VersionedTransaction,      
-    // RpcResponseAndContext,     // RPC response wrapper type
-    // SimulatedTransactionResponse,  // Simulation result type
-    // AddressLookupTableAccount,     // For transaction size optimization
-    // PublicKeyInitData              // Public key input type
   } from "@solana/web3.js";
 
   import {
@@ -18,21 +11,21 @@ import {
   } from "@solana/spl-token";
 
 import { OKXDexClient } from '@okx-dex/okx-dex-sdk';
-import { createWallet } from '@okx-dex/okx-dex-sdk/dist/core/wallet';
 import crypto from "crypto";
+import BN from "bn.js";
+
 
 
 import {
     flashBorrowReserveLiquidityInstruction,
     flashRepayReserveLiquidityInstruction,  
 } from "@solendprotocol/solend-sdk";
-import bs58 from 'bs58'; 
+
+import { OKX_API_KEY, OKX_API_PASSPHRASE, OKX_API_SECRET, OKX_PROJECT_ID, WSOL_MINT_KEY, RESERVE_ADDRESS, LENDING_MARKET, LENDING_PROGRAM_ID, SUPPLYPUBKEY, FEE_RECEIVER_ADDRESS} from "./const";
+import { Connection } from "@solana/web3.js";
+import { Wallet } from "@okx-dex/okx-dex-sdk/dist/core/wallet";
 
 
-import { OKX_API_KEY, OKX_API_PASSPHRASE, OKX_API_SECRET, OKX_PROJECT_ID, WSOL_MINT_KEY, RESERVE_ADDRESS, LENDING_MARKET, LENDING_PROGRAM_ID, SUPPLYPUBKEY, FEE_RECEIVER_ADDRESS, SOLANA_RPC_URL,  SOLANA_PRIVATE_KEY} from "./const";
-const connection = new Connection(SOLANA_RPC_URL!)
-
-const wallet = createWallet(SOLANA_PRIVATE_KEY!, connection);
 
 
 function getHeaders(timestamp: string, method: string, requestPath: string, queryString: string = "") {
@@ -88,14 +81,15 @@ async function estimateWSOLForTokenSwap({
 async function createFlashLoanIx({
     tokenAccount,
     targetToken, 
-    wsolAmount
+    wsolAmount,
+    connection, 
+    wallet
 }) {
     const accountInfo = await connection.getAccountInfo(tokenAccount);
 
     const instructions: TransactionInstruction[] = [];
 
     if (!accountInfo) {
-        console.log("ATA does not exist, you need to create it.");
         instructions.push(
           createAssociatedTokenAccountInstruction(
             wallet.publicKey,
@@ -134,7 +128,7 @@ function createTransactionInstruction(instruction: any) {
   }
 
       // 📡 Fetch instructions from OKX DEX
-async function fetchSwapInstructions(params) {
+async function fetchSwapInstructions(params, connection) {
     const timestamp = new Date().toISOString();
     const requestPath = "/api/v5/dex/aggregator/swap-instruction";
     const queryString = "?" + new URLSearchParams(params).toString();
@@ -174,11 +168,15 @@ export async function buildSimulatedFlashLoanInstructions({
     desiredTargetAmount,
     slippage = '0.1',
     userInstructions = [],
+    connection,
+    wallet
   }: {
     targetTokenMint: PublicKey,
     desiredTargetAmount: string,
     slippage?: string,
     userInstructions?: TransactionInstruction[] | (() => Promise<TransactionInstruction[]>),
+    connection: Connection,
+    wallet: Wallet
   }) {
     const client = new OKXDexClient({
         apiKey: OKX_API_KEY!,
@@ -191,26 +189,25 @@ export async function buildSimulatedFlashLoanInstructions({
             maxRetries: 3
         }
     });
-
-
-    // 🌉 Define swap parameters
-    const params = {
-        chainId: "501", // Solana
-        feePercent: "1",
-        amount: "1000000", // in lamports (0.001 SOL)
-        fromTokenAddress: "So11111111111111111111111111111111111111112", // SOL
-        toTokenAddress: targetTokenMint.toString(), // USDC
-        slippage: "0.1",
-        userWalletAddress: wallet.publicKey.toString(),
-        priceTolerance: "0",
-        autoSlippage: "false",
-        pathNum: "3",
-    };
     
     // (1) Estimate how much WSOL is needed to get `desiredTargetAmount` of targetToken
     const { wsolAmount, wsolInLamports, rate } = 
     await estimateWSOLForTokenSwap({okxclient: client, targetToken: targetTokenMint, slippage: slippage, desiredTargetAmount: desiredTargetAmount})
 
+    // 🌉 Define swap parameters
+    const params = {
+        chainId: "501", // Solana
+        feePercent: "1",
+        amount: wsolInLamports, // in lamports (0.001 SOL)
+        fromTokenAddress: "So11111111111111111111111111111111111111112", // SOL
+        toTokenAddress: targetTokenMint.toString(), // USDC
+        slippage: slippage,
+        userWalletAddress: wallet.publicKey.toString(),
+        priceTolerance: "0",
+        autoSlippage: "false",
+        pathNum: "3",
+    };
+        
     const tokenAccount = await getAssociatedTokenAddress(
         WSOL_MINT_KEY,
         wallet.publicKey,
@@ -221,47 +218,49 @@ export async function buildSimulatedFlashLoanInstructions({
     const flashLoanIxs = await createFlashLoanIx({
         tokenAccount: tokenAccount,
         targetToken: WSOL_MINT_KEY,
-        wsolAmount: wsolAmount,
+        wsolAmount: wsolInLamports,
+        connection: connection, 
+        wallet
     });
 
-    const {instructions, lookupTableAccounts} = await fetchSwapInstructions(params)
+    const {instructions, lookupTableAccounts} = await fetchSwapInstructions(params, connection)
 
-    flashLoanIxs.push(instructions)
 
     // (4) User-defined logic
     const resolvedUserInstructions =
     typeof userInstructions === "function"
         ? await userInstructions()
-        : userInstructions;
-
-    flashLoanIxs.push(...resolvedUserInstructions)
+        : userInstructions;    
     
-    flashLoanIxs.push(
-        flashRepayReserveLiquidityInstruction(
-            wsolAmount,
-            1,                           // Borrow instruction index
-            tokenAccount,                // Source liquidity (your token account)
-            SUPPLYPUBKEY,           // Destination liquidity (reserve's SPL token account)
-            FEE_RECEIVER_ADDRESS,        // Correct reserve liquidity fee receiver
-            tokenAccount,                // Host fee receiver (can be set as token account if unused)
-            RESERVE_ADDRESS,
-            LENDING_MARKET,
-            wallet.publicKey,
-            LENDING_PROGRAM_ID
-        )
-    );
+    const repay = flashRepayReserveLiquidityInstruction(
+        new BN(wsolInLamports),
+        1,                           // Borrow instruction index
+        tokenAccount,                // Source liquidity (your token account)
+        SUPPLYPUBKEY,           // Destination liquidity (reserve's SPL token account)
+        FEE_RECEIVER_ADDRESS,        // Correct reserve liquidity fee receiver
+        tokenAccount,                // Host fee receiver (can be set as token account if unused)
+        RESERVE_ADDRESS,
+        LENDING_MARKET,
+        wallet.publicKey,
+        LENDING_PROGRAM_ID
+    )
+
+    const allInstructions = [
+        ...flashLoanIxs,
+        ...instructions,
+        ...resolvedUserInstructions,
+        repay
+    ]
 
     const latestBlockhash = await connection.getLatestBlockhash('finalized');
-
-    console.log(wallet.publicKey)
 
     const messageV0 = new TransactionMessage({
         payerKey: wallet.publicKey,
         recentBlockhash: latestBlockhash.blockhash,
-        instructions: flashLoanIxs
+        instructions: allInstructions
       }).compileToV0Message(lookupTableAccounts);
 
-    // return new VersionedTransaction(messageV0);
+    return new VersionedTransaction(messageV0);
   }
 
 
