@@ -135,7 +135,3 @@ The service includes error handling for:
 ## License
 
 MIT
-
-## Support
-
-For support, please [contact details or issue tracker information]
