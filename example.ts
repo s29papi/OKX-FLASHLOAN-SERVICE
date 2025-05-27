@@ -10,6 +10,7 @@ async function main() {
     const wallet = createWallet(SOLANA_PRIVATE_KEY!, connection);
     const targetTokenMint = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
     const desiredTargetAmount = "100000000"
+    // the function making use of the borrowed amount, as an instruction should be added
     const tx = await buildSimulatedFlashLoanInstructions({targetTokenMint, desiredTargetAmount, connection, wallet})
     const result = await connection.simulateTransaction(tx)
     console.log(result)
